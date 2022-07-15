@@ -1,122 +1,114 @@
-import struct
-import typing as t
-from enum import Enum, auto
+import sys
+import json
+from controller import Device, Event, Key
+import vlc
+import time
 
 
+class Player:
+    def __init__(self, state):
+        self.sources = state['sources']
+        self.start_time = state.get('current_time', 0)
 
-class Key(Enum):
-    up = auto()
-    down = auto()
-    left = auto()
-    right = auto()
-    shr = auto()
-    shl = auto()
-    a = auto()
-    b = auto()
-    x = auto()
-    y = auto()
-    select = auto()
-    start = auto()
+        try:
+            current_source = state['current_source']
+            self.source_index = self.sources.index(current_source)
+        except ValueError:
+            self.source_index = 0
 
 
-class Event(Enum):
-    keydn = auto()
-    keyup = auto()
+        self.vlc_instance = vlc.Instance()
+        self.player = self.vlc_instance.media_player_new()
 
+    def current_source(self):
+        return self.sources[self.source_index]
 
-class Device:
-    def __init__(self):
-        self.infile = open('/dev/input/by-id/usb-0079_USB_Gamepad-event-joystick', 'rb')
-        self.arrow_down = None
+    def play(self):
+        source = self.current_source()
+        # print(source, self.start_time / 1000)
+        media = self.vlc_instance.media_new(source)
+        self.player.set_media(media)
+        self.player.play()
+        self.player.set_fullscreen(True)
+        self.player.set_time(self.start_time)
+        time.sleep(0.1)
+        self.player.video_set_spu(-1) # disable subtitles
 
-    def __del__(self):
-        self.infile.close()
+    def play_next(self):
+        self.source_index += 1
+        self.source_index %= len(self.sources)
+        self.start_time = 0
+        self.play()
 
-    def _read_word(self) -> int:
-        data = self.infile.read(4)
-        (value,) = struct.unpack("<L", data)
-        return value
+    def play_prev(self):
+        self.source_index -= 1
+        self.source_index %= len(self.sources)
+        self.start_time = 0
+        self.play()
 
-    def _read_packet(self) -> t.Tuple[int, int, int, int, int, int]:
-        word1 = self._read_word()
-        word2 = self._read_word()
-        word3 = self._read_word()
-        word4 = self._read_word()
-        word5 = self._read_word()
-        word6 = self._read_word()
-        return word1, word2, word3, word4, word5, word6
-
-    def read(self) -> t.Tuple[Event, Key]:
-        seq, zero, time, zero, key1, key2 = self._read_packet()
-
-        is_arrow = key1 & 0x11 != 0
-
-        seq, zero, time, zero, unknown, state = self._read_packet()
-
-        if not is_arrow:
-            self._read_packet()
-
-        if is_arrow:
-            keydown = key2 == 0xff or key2 == 0x00
+    def ff(self, amount):
+        new_time = self.player.get_time() + amount
+        if new_time > self.player.get_length():
+            self.play_next()
         else:
-            keydown = state == 1
+            self.player.set_time(new_time)
 
-
-        if is_arrow:
-            is_updown = key1 & 0xffff0000 == 0x00010000
-            is_upleft = key2 == 0x0
-            key = {
-                (True, True): Key.up,
-                (True, False): Key.down,
-                (False, True): Key.left,
-                (False, False): Key.right,
-            }[is_updown, is_upleft]
+    def rewind(self, amount):
+        new_time = self.player.get_time() - amount
+        if new_time < 0:
+            self.play_prev()
         else:
-            key = {
-                1: Key.x,
-                2: Key.a,
-                3: Key.b,
-                4: Key.y,
-                5: Key.shl,
-                6: Key.shr,
-                9: Key.select,
-                10: Key.start,
-            }[key2 & 0xf]
+            self.player.set_time(new_time)
 
-#        print(f'key1    = {key1:08x}')
-#        print(f'key2    = {key2:08x}')
-#        print(f'unknown = {unknown}')
-#        print(f'state   = {state}')
-#        print()
-#        print(f'arrow?    {is_arrow}')
-#        print(f'key     = {key}')
-#        print(f'keydown?  {keydown}')
-#        print(f'updown?   {is_updown}')
-#        print(f'{word1:08x}  {word2:08x}  {word3:08x}  {word4:08x}  {word5:08x}  {word6:08x} ')
-#        print("DONE")
-#        print()
+    def pause(self):
+        self.player.pause()
 
-        if is_arrow and keydown:
-            self.arrow_down = key
-
-        if keydown:
-            event = Event.keydn
+    def state(self):
+        if self.player.is_playing:
+            current_time = self.player.get_time()
         else:
-            event = Event.keyup
+            current_time = self.start_time
 
-        if event == Event.keyup and is_arrow:
-            key = self.arrow_down
-            self.arrow_down = None
-
-        return event, key
-
+        return {
+            'sources': self.sources,
+            'current_source': self.sources[self.source_index],
+            'current_time': current_time,
+        }
 
 
 def main():
     device = Device()
-    while True:
-        event, key = device.read()
-        print(event, key)
+    with open('state.json') as infile:
+        state = json.load(infile)
+
+    player = Player(state)
+    player.play()
+
+    try:
+        while True:
+            event, key = device.read()
+            if event == Event.keyup and key == Key.right:
+                player.ff(3000)
+            elif event == Event.keyup and key == Key.left:
+                player.rewind(3000)
+            elif event == Event.keyup and key == Key.shl:
+                player.rewind(10000)
+            elif event == Event.keyup and key == Key.shr:
+                player.ff(10000)
+            elif event == Event.keyup and key == Key.start:
+                player.pause()
+            elif event == Event.keydn and key == Key.select:
+                break
+#            elif event == Event.keydn and key == Key.a:
+#                breakpoint()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with open('state.json', 'w') as outfile:
+            json.dump(player.state(), outfile, indent=4, ensure_ascii=False)
+
+        sys.exit(0)
+
 
 
 if __name__ == '__main__':
